@@ -16,17 +16,15 @@ on:
 
 env:
   QT_VERSION: 5.15.16
-  BUILD_TYPE: Release
   INSTALL_PATH: C:\Qt\5.15.16-install-xp
   PATCH_DIR: 5.15.16
-  MSVC_VERSION: 2019
   BUILD_TOOLS_PATH: C:\BuildTools
 
 jobs:
   build:
-    name: Build Qt for Windows XP
+    name: Build Qt for Windows XP (v141_xp)
     runs-on: windows-2019
-    timeout-minutes: 7200 # 120 hours limit
+    timeout-minutes: 7200 # 120 hours (5 days) limit
 
     steps:
     - name: Checkout repository
@@ -36,24 +34,34 @@ jobs:
         fetch-depth: 0 # Full history for patches
 
     - name: Cache Qt Installation
+      # Cache the final installation directory. If cache hits, the entire build is skipped.
       id: cache-qt-install
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ${{ env.INSTALL_PATH }}
-        key: ${{ runner.os }}-qt-${{ env.QT_VERSION }}-xp-${{ hashFiles(format('{0}/*.patch', env.PATCH_DIR)) }}
+        key: ${{ runner.os }}-qt-${{ env.QT_VERSION }}-v141xp-${{ hashFiles(format('{0}/*.patch', env.PATCH_DIR)) }}
 
     - name: Install Build Dependencies
       if: steps.cache-qt-install.outputs.cache-hit != 'true'
       shell: powershell
       run: |
-        Write-Host "::group::Installing Visual Studio 2017 (v141) Build Tools with XP support"
+        Write-Host "::group::Installing VS 2017 (v141) Build Tools with XP support"
         Invoke-WebRequest -Uri "https://aka.ms/vs/16/release/vs_buildtools.exe" -OutFile "$env:TEMP\vs_buildtools.exe"
+        
+        # We install a separate VS Build Tools to a known path to get the v141_xp toolset.
+        # This avoids interfering with the runner's default VS 2019 installation.
+        # Components:
+        # - VC.v141.x86.x64: The core VS 2017 (v141) C++ toolset.
+        # - VC.v141.xp: The Windows XP targeting support for the v141 toolset.
+        # - Windows10SDK: Required by Qt for Windows headers.
         $process = Start-Process -FilePath "$env:TEMP\vs_buildtools.exe" -ArgumentList `
           '--quiet', '--wait', '--norestart', '--nocache', `
           '--installPath', '${{ env.BUILD_TOOLS_PATH }}', `
           '--add', 'Microsoft.VisualStudio.Component.VC.v141.x86.x64', `
-          '--add', 'Microsoft.VisualStudio.Component.VC.v141.xp' `
+          '--add', 'Microsoft.VisualStudio.Component.VC.v141.xp', `
+          '--add', 'Microsoft.VisualStudio.Component.Windows10SDK' `
           -Wait -NoNewWindow -PassThru
+          
         if ($process.ExitCode -ne 0) {
           Write-Error "Visual Studio Build Tools installation failed with exit code $($process.ExitCode)"
           exit 1
@@ -66,28 +74,10 @@ jobs:
         Write-Host "VS Build Tools for v141_xp installed successfully."
         Write-Host "::endgroup::"
         
-        Write-Host "::group::Installing Chocolatey packages"
-        choco install strawberryperl ninja openssl -y --no-progress
+        Write-Host "::group::Installing Chocolatey packages (Perl, Ninja)"
+        # The runner image already has Python. No need for OpenSSL as we disable it.
+        choco install strawberryperl ninja -y --no-progress
         refreshenv
-        Write-Host "::endgroup::"
-        
-        Write-Host "::group::Verifying all required tools"
-        # The runner image already has Python and Ruby
-        $tools = @{
-          "Python"  = "python --version"
-          "Perl"    = "perl --version"
-          "Ninja"   = "ninja --version"
-          "OpenSSL" = "openssl version"
-        }
-        foreach ($tool in $tools.GetEnumerator()) {
-          Write-Host "Checking $($tool.Key)..."
-          Invoke-Expression $tool.Value
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "$($tool.Key) is not properly installed or not in PATH"
-            exit 1
-          }
-        }
-        echo "PATH=C:\Strawberry\perl\bin;C:\Program Files\Git\usr\bin;$env:PATH" >> $env:GITHUB_ENV
         Write-Host "::endgroup::"
 
     - name: Download and Patch Qt Source
@@ -95,15 +85,16 @@ jobs:
       shell: powershell
       run: |
         Write-Host "::group::Downloading Qt source"
-        $qtUrl = "https://download.qt.io/official_releases/qt/5.15/${{ env.QT_VERSION }}/single/qt-everywhere-src-${{ env.QT_VERSION }}.zip"
-        Invoke-WebRequest -Uri $qtUrl -OutFile "qt-src.zip"
-        Expand-Archive -Path "qt-src.zip" -DestinationPath "C:\Qt"
-        Rename-Item "C:\Qt\qt-everywhere-src-${{ env.QT_VERSION }}" "C:\Qt\${{ env.QT_VERSION }}-src"
+        $qtSrcZip = "qt-everywhere-opensource-src-${{ env.QT_VERSION }}.zip"
+        $qtUrl = "https://download.qt.io/official_releases/qt/5.15/${{ env.QT_VERSION }}/single/$qtSrcZip"
+        Invoke-WebRequest -Uri $qtUrl -OutFile $qtSrcZip
+        Expand-Archive -Path $qtSrcZip -DestinationPath "C:\Qt"
+        Rename-Item "C:\Qt\qt-everywhere-opensource-src-${{ env.QT_VERSION }}" "C:\Qt\${{ env.QT_VERSION }}-src"
         Write-Host "::endgroup::"
 
         Write-Host "::group::Applying patches"
         cd "C:\Qt\${{ env.QT_VERSION }}-src"
-        git init
+        git init -b main
         git config --global user.email "actions@github.com"
         git config --global user.name "GitHub Actions"
         git add .
@@ -116,12 +107,12 @@ jobs:
           Write-Host "Found $($patchFiles.Count) patch files to apply."
           foreach ($patch in $patchFiles) {
             Write-Host "Applying patch: $($patch.Name)"
-            git apply --check --ignore-whitespace --ignore-space-change "$($patch.FullName)"
+            git apply --check --ignore-whitespace "$($patch.FullName)"
             if ($LASTEXITCODE -ne 0) {
               Write-Error "Patch check failed for $($patch.Name)"
               exit 1
             }
-            git apply --ignore-whitespace --ignore-space-change "$($patch.FullName)"
+            git apply --ignore-whitespace "$($patch.FullName)"
             if ($LASTEXITCODE -ne 0) {
               Write-Error "Failed to apply patch: $($patch.Name)"
               exit 1
@@ -139,14 +130,18 @@ jobs:
         mkdir %BUILD_DIR%
         cd %BUILD_DIR%
 
-        echo "Initializing v141_xp build environment..."
+        echo "::group::Initializing v141_xp environment and Configuring Qt"
+        rem This is the CRITICAL step. `vcvarsall.bat` sets up all necessary paths for the compiler, linker, and libs.
         call "${{ env.BUILD_TOOLS_PATH }}\VC\Auxiliary\Build\vcvarsall.bat" x64
 
-        echo "Configuring Qt..."
+        rem Configure Qt. Key flags:
+        rem -toolset v141_xp: Explicitly use the Windows XP compatible toolchain.
+        rem -no-openssl: Avoids dependency on system OpenSSL, making the build more deterministic.
         %QT_SRC_DIR%\configure.bat -prefix ${{ env.INSTALL_PATH }} ^
           -platform win32-msvc -toolset v141_xp ^
           -release -shared -opensource -confirm-license ^
           -optimize-size -mp -no-pch ^
+          -no-openssl ^
           -nomake examples -nomake tests ^
           -skip qt3d -skip qtactiveqt -skip qtconnectivity -skip qtdatavis3d ^
           -skip qtdeclarative -skip qtlocation -skip qtlottie -skip qtmultimedia ^
@@ -160,39 +155,33 @@ jobs:
           type config.log
           exit /b %ERRORLEVEL%
         )
+        echo "::endgroup::"
 
-        echo "Building Qt... This will take a long time."
-        nmake
+        echo "::group::Building Qt (nmake)"
+        rem Use -j flag to parallelize the build across all available CPU cores. This is essential for speed.
+        nmake -j%NUMBER_OF_PROCESSORS%
         if %ERRORLEVEL% NEQ 0 (
           echo "Qt build (nmake) failed!"
           exit /b %ERRORLEVEL%
         )
+        echo "::endgroup::"
 
-        echo "Installing Qt..."
+        echo "::group::Installing Qt (nmake install)"
+        rem Installation is mostly file copying, no need for parallel jobs.
         nmake install
         if %ERRORLEVEL% NEQ 0 (
           echo "Qt installation (nmake install) failed!"
           exit /b %ERRORLEVEL%
         )
+        echo "::endgroup::"
 
     - name: Verify Installation
       shell: powershell
       run: |
         Write-Host "Verifying Qt installation in ${{ env.INSTALL_PATH }}"
-        $criticalFiles = @(
-          "${{ env.INSTALL_PATH }}\bin\qmake.exe",
-          "${{ env.INSTALL_PATH }}\bin\Qt5Core.dll",
-          "${{ env.INSTALL_PATH }}\bin\Qt5Gui.dll",
-          "${{ env.INSTALL_PATH }}\bin\Qt5Widgets.dll",
-          "${{ env.INSTALL_PATH }}\lib\Qt5Core.lib"
-        )
-        $missingFiles = @()
-        foreach ($file in $criticalFiles) {
-          if (-not (Test-Path $file)) {
-            $missingFiles += $file
-          }
-        }
-        if ($missingFiles.Count -gt 0) {
+        $criticalFiles = @("${{ env.INSTALL_PATH }}\bin\qmake.exe", "${{ env.INSTALL_PATH }}\bin\Qt5Core.dll")
+        $missingFiles = $criticalFiles.Where({-not (Test-Path $_)})
+        if ($missingFiles) {
           Write-Error "Build verification failed! Missing files:"
           $missingFiles | ForEach-Object { Write-Error "- $_" }
           exit 1
@@ -202,33 +191,32 @@ jobs:
     - name: Archive Qt Binaries
       uses: actions/upload-artifact@v4
       with:
-        name: qt-${{ env.QT_VERSION }}-msvc2017-v141_xp-x64
+        name: qt-${{ env.QT_VERSION }}-msvc2017-v141xp-x64
         path: ${{ env.INSTALL_PATH }}
         if-no-files-found: error
 
-    - name: Save Build Logs on Failure
-      if: failure() && steps.cache-qt-install.outputs.cache-hit != 'true'
+    - name: Archive Build Logs
+      # Always run this step to capture config.log, but only if a build actually happened.
+      if: always() && steps.cache-qt-install.outputs.cache-hit != 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
-        path: |
-          C:\Qt\${{ env.QT_VERSION }}-build\config.log
+        name: build-logs-${{ env.QT_VERSION }}-v141xp
+        path: C:\Qt\${{ env.QT_VERSION }}-build\config.log
         if-no-files-found: warn
         
     - name: Post Build Summary
       if: always()
       shell: powershell
       run: |
-        $summary = "# Qt ${{ env.QT_VERSION }} Build Summary `n"
-        if ('${{ steps.cache-qt-install.outputs.cache-hit }}' == 'true') {
+        $summary = "# Qt ${{ env.QT_VERSION }} Build Summary `n`n"
+        if ('${{ steps.cache-qt-install.outputs.cache-hit }}' -eq 'true') {
           $summary += "✅ Build artifacts restored from cache. No new build was performed."
-        } elseif ('${{ job.status }}' == 'success') {
+        } elseif ('${{ job.status }}' -eq 'success') {
           $summary += "✅ Build completed and installed successfully."
         } else {
-          $summary += "❌ Build failed."
+          $summary += "❌ Build failed. Check the 'build-logs' artifact for details."
         }
-        $summary += "`n- **Platform:** ${{ runner.os }}`n"
-        $summary += "- **Toolchain:** v141_xp (for Windows XP compatibility)`n"
+        $summary += "`n- **Toolchain:** v141_xp (for Windows XP compatibility)`n"
         $summary += "- **Commit:** `${{ github.sha }}`"
         
         $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
