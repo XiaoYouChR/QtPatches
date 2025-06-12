@@ -1,0 +1,389 @@
+name: Build Qt with v141_xp
+run-name: Qt 5.15.16 Build by @${{ github.actor }}
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '5.15.16/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '5.15.16/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+env:
+  QT_VERSION: 5.15.16
+  BUILD_TYPE: Release
+  INSTALL_PATH: C:\Qt\5.15.16-install
+  PATCH_DIR: 5.15.16
+  GITTAG: v5.15.16
+  MSVC_VERSION: 2019
+
+jobs:
+  build:
+    name: Build Qt ${{ env.QT_VERSION }}
+    runs-on: windows-2019
+    timeout-minutes: 7200  # 48 hours limit
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0  # Full history for patches
+        
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v1.3
+      with:
+        vs-version: '[16.0,17.0)'  # VS2019
+        
+    - name: Setup VS Dev Environment
+      uses: seanmiddleditch/gha-setup-vsdevenv@v4
+      with:
+        arch: x64
+
+    - name: Set up Developer Command Prompt
+      run: |
+        echo "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build" >> $GITHUB_PATH
+      shell: bash
+
+    - name: Install Windows XP support
+      run: |
+        Write-Host "::group::Installing Visual Studio components"
+        
+        # Download VS installer
+        Invoke-WebRequest -Uri "https://aka.ms/vs/16/release/vs_buildtools.exe" -OutFile "$env:TEMP\vs_buildtools.exe"
+        
+        # Install required components
+        $process = Start-Process -FilePath "$env:TEMP\vs_buildtools.exe" -ArgumentList `
+          "--quiet", "--wait", "--norestart", "--nocache", `
+          "--installPath", "C:\BuildTools", `
+          "--add", "Microsoft.VisualStudio.Component.VC.v141.x86.x64", `
+          "--add", "Microsoft.VisualStudio.Component.VC.140", `
+          "--add", "Microsoft.VisualStudio.Component.Windows10SDK", `
+          "--add", "Microsoft.VisualStudio.Component.VC.v141.xp", `
+          "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" `
+          -Wait -NoNewWindow -PassThru
+        
+        if ($process.ExitCode -ne 0) {
+          Write-Error "Visual Studio Build Tools installation failed with exit code $($process.ExitCode)"
+          exit 1
+        }
+        
+        # Verify installation
+        $clExePath = "C:\BuildTools\VC\Tools\MSVC\14.16.27023\bin\Hostx64\x64\cl.exe"
+        if (-not (Test-Path $clExePath)) {
+          Write-Error "MSVC tools installation failed - cl.exe not found at $clExePath"
+          exit 1
+        }
+        Write-Host "::endgroup::"
+      shell: powershell
+
+    - name: Install Build Dependencies
+      run: |
+        Write-Host "::group::Checking and Installing Python"
+        python --version
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Python is not properly installed"
+          exit 1
+        }
+        
+        # Ensure pip is installed and updated
+        python -m ensurepip --upgrade
+        python -m pip install --upgrade pip
+        pip install wheel setuptools
+        
+        Write-Host "::group::Installing Perl"
+        choco install strawberryperl -y --no-progress
+        refreshenv
+        perl --version
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Perl installation failed"
+          exit 1
+        }
+        
+        # Verify Perl modules
+        perl -e "use Thread::Queue"
+        if ($LASTEXITCODE -ne 0) {
+          cpan Thread::Queue
+        }
+        
+        Write-Host "::group::Installing Ruby"
+        choco install ruby.install --version=2.7.8.1 -y --no-progress
+        refreshenv
+        ruby --version
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Ruby installation failed"
+          exit 1
+        }
+        
+        # Update RubyGems and install required gems
+        gem update --system
+        gem install bundler
+        
+        Write-Host "::group::Installing additional tools"
+        choco install ninja openssl -y --no-progress
+        refreshenv
+        
+        Write-Host "::group::Verifying all required tools"
+        $tools = @{
+          "Python" = "python --version"
+          "Perl" = "perl --version"
+          "Ruby" = "ruby --version"
+          "Ninja" = "ninja --version"
+          "OpenSSL" = "openssl version"
+        }
+        
+        foreach ($tool in $tools.GetEnumerator()) {
+          Write-Host "Checking $($tool.Key)..."
+          Invoke-Expression $tool.Value
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "$($tool.Key) is not properly installed"
+            exit 1
+          }
+        }
+        
+        # Set environment variables
+        $env:PATH = "C:\Strawberry\perl\bin;C:\Ruby27-x64\bin;$env:PATH"
+        echo "PATH=$env:PATH" >> $env:GITHUB_ENV
+        
+        Write-Host "Environment Summary:"
+        Write-Host "Python Version: $(python --version 2>&1)"
+        Write-Host "Perl Version: $(perl --version 2>&1 | Select-Object -First 1)"
+        Write-Host "Ruby Version: $(ruby --version)"
+        Write-Host "Ninja Version: $(ninja --version)"
+        Write-Host "OpenSSL Version: $(openssl version)"
+        Write-Host "MSVC Version: $(cl.exe 2>&1 | Select-Object -First 1)"
+      shell: powershell
+
+    - name: Cache Qt Build
+      id: cache-qt
+      uses: actions/cache@v3
+      with:
+        path: |
+          C:\Qt\${{ env.QT_VERSION }}-build
+        key: ${{ runner.os }}-qt-${{ env.QT_VERSION }}-${{ hashFiles('${{ env.PATCH_DIR }}/*.patch') }}
+        restore-keys: |
+          ${{ runner.os }}-qt-${{ env.QT_VERSION }}-
+
+    - name: Download Qt Source
+      if: steps.cache-qt.outputs.cache-hit != 'true'
+      run: |
+        Write-Host "::group::Downloading Qt source"
+        $qtUrl = "https://download.qt.io/official_releases/qt/5.15/${{ env.QT_VERSION }}/single/qt-everywhere-opensource-src-${{ env.QT_VERSION }}.zip"
+        
+        Write-Host "Downloading from: $qtUrl"
+        Invoke-WebRequest -Uri $qtUrl -OutFile "qt-src.zip"
+        
+        if (-not (Test-Path "qt-src.zip")) {
+          Write-Error "Qt source download failed"
+          exit 1
+        }
+        
+        Write-Host "Extracting Qt source..."
+        Expand-Archive -Path "qt-src.zip" -DestinationPath "C:\Qt"
+        
+        Rename-Item "C:\Qt\qt-everywhere-opensource-src-${{ env.QT_VERSION }}" "${{ env.QT_VERSION }}-src"
+        
+        if (-not (Test-Path "C:\Qt\${{ env.QT_VERSION }}-src\configure.bat")) {
+          Write-Error "Qt source extraction failed - configure.bat not found"
+          exit 1
+        }
+        
+        # Initialize Git repository for patch application
+        cd "C:\Qt\${{ env.QT_VERSION }}-src"
+        git init
+        git add .
+        git config --global user.email "actions@github.com"
+        git config --global user.name "GitHub Actions"
+        git commit -m "Initial commit of Qt ${{ env.QT_VERSION }} source"
+        
+        Write-Host "::endgroup::"
+      shell: powershell
+
+    - name: Apply Patches
+      if: steps.cache-qt.outputs.cache-hit != 'true'
+      run: |
+        Write-Host "::group::Applying patches"
+        cd "C:\Qt\${{ env.QT_VERSION }}-src"
+        
+        # Get all patch files
+        $patchFiles = Get-ChildItem -Path "${{ github.workspace }}\${{ env.PATCH_DIR }}\*.patch" | Sort-Object Name
+        
+        if ($patchFiles.Count -eq 0) {
+          Write-Error "No patch files found in ${{ env.PATCH_DIR }}"
+          exit 1
+        }
+        
+        Write-Host "Found $($patchFiles.Count) patch files to apply"
+        
+        foreach ($patch in $patchFiles) {
+          Write-Host "Applying patch: $($patch.Name)"
+          git apply --ignore-whitespace --ignore-space-change --whitespace=fix "$($patch.FullName)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to apply patch: $($patch.Name)"
+            git apply --show-error "$($patch.FullName)"
+            exit 1
+          }
+          Write-Host "Successfully applied patch: $($patch.Name)"
+        }
+        
+        Write-Host "::endgroup::"
+      shell: powershell
+
+    - name: Configure Qt
+      if: steps.cache-qt.outputs.cache-hit != 'true'
+      run: |
+        mkdir C:\Qt\${{ env.QT_VERSION }}-build
+        cd C:\Qt\${{ env.QT_VERSION }}-build
+        
+        echo "Setting up environment variables..."
+        set INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.17763.0\um;%INCLUDE%
+        set LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.17763.0\um\x64;%LIB%
+        
+        echo "Starting Qt configuration..."
+        C:\Qt\${{ env.QT_VERSION }}-src\configure.bat -platform win32-msvc ^
+          -prefix %INSTALL_PATH% ^
+          -shared ^
+          -release ^
+          -mp ^
+          -optimize-size ^
+          -no-pch ^
+          -no-direct2d ^
+          -nomake tests ^
+          -nomake examples ^
+          -skip qt3d -skip qtactiveqt -skip qtconnectivity -skip qtdatavis3d ^
+          -skip qtdeclarative -skip qtlocation -skip qtlottie -skip qtmultimedia ^
+          -skip qtnetworkauth -skip qtpurchasing -skip qtquick3d ^
+          -skip qtquickcontrols -skip qtquickcontrols2 -skip qtquicktimeline ^
+          -skip qtremoteobjects -skip qtsensors -skip qtvirtualkeyboard ^
+          -skip qtwebchannel -skip qtwebengine -skip qtwebglplugin ^
+          -skip qtwebsockets -skip qtwebview ^
+          -no-sql-odbc -no-sql-sqlite ^
+          -opensource -confirm-license
+        
+        if %ERRORLEVEL% NEQ 0 (
+          echo "Qt configuration failed with error code %ERRORLEVEL%"
+          type config.log
+          exit /b 1
+        )
+      shell: cmd
+
+    - name: Build Qt
+      if: steps.cache-qt.outputs.cache-hit != 'true'
+      run: |
+        cd C:\Qt\${{ env.QT_VERSION }}-build
+        echo "Starting Qt build with %NUMBER_OF_PROCESSORS% processors..."
+        
+        nmake -j%NUMBER_OF_PROCESSORS%
+        if %ERRORLEVEL% NEQ 0 (
+          echo "Qt build failed with error code %ERRORLEVEL%"
+          exit /b 1
+        )
+      shell: cmd
+
+    - name: Install Qt
+      run: |
+        cd C:\Qt\${{ env.QT_VERSION }}-build
+        echo "Installing Qt..."
+        
+        nmake install
+        if %ERRORLEVEL% NEQ 0 (
+          echo "Qt installation failed with error code %ERRORLEVEL%"
+          exit /b 1
+        )
+      shell: cmd
+
+    - name: Build Status Check
+      run: |
+        Write-Host "::group::Verifying build artifacts"
+        $criticalFiles = @(
+          "${{ env.INSTALL_PATH }}\bin\Qt5Core.dll",
+          "${{ env.INSTALL_PATH }}\bin\Qt5Gui.dll",
+          "${{ env.INSTALL_PATH }}\bin\Qt5Widgets.dll",
+          "${{ env.INSTALL_PATH }}\lib\Qt5Core.lib",
+          "${{ env.INSTALL_PATH }}\lib\Qt5Gui.lib",
+          "${{ env.INSTALL_PATH }}\lib\Qt5Widgets.lib"
+        )
+        
+        $missing = @()
+        foreach ($file in $criticalFiles) {
+          if (-not (Test-Path $file)) {
+            $missing += $file
+          } elseif ($file -like "*.dll") {
+            # Verify if DLL is a valid PE file
+            try {
+              $dllBytes = [System.IO.File]::ReadAllBytes($file)
+              if ($dllBytes[0] -ne 0x4D -or $dllBytes[1] -ne 0x5A) {
+                $missing += "$file (Invalid PE file)"
+              }
+            } catch {
+              $missing += "$file (Read error: $_)"
+            }
+          }
+        }
+        
+        if ($missing.Count -gt 0) {
+          Write-Error "Missing or invalid critical files:`n$($missing -join "`n")"
+          exit 1
+        }
+        
+        Write-Host "All critical files present and valid"
+        Write-Host "::endgroup::"
+      shell: powershell
+
+    - name: Archive Qt binaries
+      uses: actions/upload-artifact@v3
+      with:
+        name: qt-${{ env.QT_VERSION }}-binaries
+        path: |
+          ${{ env.INSTALL_PATH }}\bin
+          ${{ env.INSTALL_PATH }}\lib
+          ${{ env.INSTALL_PATH }}\plugins
+          ${{ env.INSTALL_PATH }}\qml
+          ${{ env.INSTALL_PATH }}\include
+        if-no-files-found: error
+
+    - name: Save build logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs
+        path: |
+          C:\Qt\${{ env.QT_VERSION }}-build\config.log
+          C:\Qt\${{ env.QT_VERSION }}-build\build.log
+        if-no-files-found: warn
+
+    - name: Build Summary
+      if: always()
+      run: |
+        $duration = [DateTime]::UtcNow - [DateTime]::Parse('${{ steps.build_start.outputs.time }}')
+        
+        $summary = @"
+        # Qt ${{ env.QT_VERSION }} Build Summary
+        
+        - **Start Time:** ${{ steps.build_start.outputs.time }} UTC
+        - **End Time:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss") UTC
+        - **Duration:** $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s
+        - **Builder:** @${{ github.actor }}
+        - **Build Type:** ${{ env.BUILD_TYPE }}
+        - **Platform:** ${{ runner.os }}
+        - **Commit:** ${{ github.sha }}
+        
+        ## Build Artifacts
+        - Qt binaries (bin, lib, plugins, qml, include)
+        - Build logs (config.log, build.log)
+        
+        ## Build Configuration
+        - Built with v141_xp toolchain for Windows XP compatibility
+        - Shared libraries (-shared build)
+        - Release configuration
+        - Optimized for size (-optimize-size)
+        - Multi-processor compilation (-mp)
+        "@
+        
+        $summary | Out-File -FilePath "$env:GITHUB_STEP_SUMMARY" -Encoding UTF8
+      shell: powershell
